@@ -1,4 +1,4 @@
-# Hospital API — Tutorial 8
+# Hospital API - Tutorial 8
 
 Aplikacja WebAPI w ASP.NET Core do zarządzania pacjentami i przypisaniami łóżek szpitalnych.
 
@@ -147,9 +147,117 @@ Serwer szuka łóżka spełniającego jednocześnie:
 Dwa przedziały czasowe kolidują gdy:
 ```
 istniejące.From < nowe.To  AND  istniejące.To > nowe.From
+```
+
+---
+
+## Jak działa kod
+
+### Architektura
+
+Aplikacja jest zbudowana w trójwarstwowym wzorcu:
+
+```
+HTTP Request
+PatientsController        (warstwa prezentacji)
+IPatientsService          (interfejs)
+PatientsService           (warstwa logiki biznesowej)
+MasterContext (EF Core)   (warstwa dostępu do danych)
+MS SQL Server
+```
+
+---
+
+### PatientsController
+
+Kontroler przyjmuje żądania HTTP i deleguje pracę do serwisu. Nie zawiera żadnej logiki biznesowej.
+
+```csharp
+[HttpGet]
+public async Task<IActionResult> GetPatients([FromQuery] string? search, ...)
+```
+```csharp
+[HttpPost("{pesel}/bedassignments")]
+public async Task<IActionResult> AssignBed([FromRoute] string pesel, [FromBody] AssignBedRequest request, ...)
+```
+---
+
+### GetPatientsAsync
+
+Metoda pobiera pacjentów z opcjonalnym filtrowaniem, a następnie ładuje powiązane dane.
+
+**Krok 1 - budowanie zapytania z filtrem:**
+```csharp
+var query = db.Patients.AsQueryable();
+if (!string.IsNullOrWhiteSpace(search))
+{
+    query = query.Where(p =>
+        EF.Functions.Like(p.FirstName, $"%{search}%") ||
+        EF.Functions.Like(p.LastName, $"%{search}%"));
+}
+```
+`EF.Functions.Like` generuje SQL `LIKE '%search%'`
+
+**Krok 2 - ładowanie powiązanych encji (eager loading):**
+```csharp
+.Include(p => p.Admissions).ThenInclude(a => a.Ward)
+.Include(p => p.BedAssignments).ThenInclude(ba => ba.Bed).ThenInclude(b => b.BedTypeNavigation)
+.Include(p => p.BedAssignments).ThenInclude(ba => ba.Bed).ThenInclude(b => b.Room).ThenInclude(r => r.Ward)
+```
+`Include` i `ThenInclude` mówią EF Core żeby dołączył powiązane tabele w jednym zapytaniu SQL (JOIN), zamiast robić osobne zapytania dla każdej encji.
+
+**Krok 3 - mapowanie do DTO:**
+```csharp
+.Select(p => new PatientResponse { ... })
+```
+Zamiast zwracać modele bazodanowe bezpośrednio, mapujemy je na obiekty DTO (Data Transfer Object). Dzięki temu kontrolujemy dokładnie co trafia do odpowiedzi JSON i nie ujawniamy wewnętrznej struktury bazy.
+
+---
+
+### AssignBedAsync
+
+Metoda przypisuje łóżko pacjentowi w trzech krokach.
+
+**Krok 1 - weryfikacja czy pacjent istnieje:**
+```csharp
+var patientExists = await db.Patients
+    .AnyAsync(p => p.Pesel.Trim() == pesel.Trim(), cancellationToken);
+if (!patientExists)
+    throw new NotFoundException($"Pacjent o numerze PESEL {pesel} nie istnieje.");
+```
+
+**Krok 2 - wyszukanie wolnego łóżka:**
+```csharp
+var availableBed = await db.Beds
+    .Where(b => b.BedTypeId == request.BedTypeId && b.Room.WardId == request.WardId)
+    .Where(b => !db.BedAssignments.Any(ba =>
+        ba.BedId == b.Id &&
+        (request.To == null || ba.From < request.To) &&
+        (ba.To == null || ba.To > request.From)))
+    .FirstOrDefaultAsync(cancellationToken);
+```
+
+**Krok 3 - zapis nowego przypisania:**
+```csharp
+var newAssignment = new BedAssignment
+{
+    PatientPesel = pesel.Trim(),
+    BedId = availableBed.Id,
+    From = request.From,
+    To = request.To
+};
+db.BedAssignments.Add(newAssignment);
+await db.SaveChangesAsync(cancellationToken);
+```
+EF Core śledzi nowy obiekt i generuje `INSERT INTO BedAssignments ...` przy wywołaniu `SaveChangesAsync`.
+
+---
+
+### MasterContext
+
+Kontekst bazy danych wygenerowany przez scaffold (`Database First`). Definiuje:
+- `DbSet<T>` - każdy odpowiada tabeli w bazie i umożliwia zapytania LINQ
+- `OnModelCreating` - konfiguracja relacji, kluczy, typów kolumn (np. `char(11)` dla PESEL, `datetime` dla dat)
 
 ## Autor
 Hanna Krechyk s32740
-```
-
-##
