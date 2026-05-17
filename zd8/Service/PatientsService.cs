@@ -17,29 +17,75 @@ public class PatientsService(MasterContext db) : IPatientsService
                 EF.Functions.Like(p.FirstName, $"%{search}%") ||
                 EF.Functions.Like(p.LastName, $"%{search}%"));
         }
-        return await query.Select(p=>new PatientResponse
-        {
-            Pesel = p.Pesel,
-            FirstName = p.FirstName,
-            LastName = p.LastName,
-            Age = p.Age,
-            Sex = p.Sex
-        }).ToListAsync(cancellationToken);
+        return await query
+            .Include(p => p.Admissions).ThenInclude(a => a.Ward)
+            .Include(p => p.BedAssignments).ThenInclude(ba => ba.Bed).ThenInclude(b => b.BedTypeNavigation)
+            .Include(p=>p.BedAssignments)
+            .ThenInclude(ba=>ba.Bed).ThenInclude(b=>b.Room).ThenInclude(r=>r.Ward)
+            .Select(p => new PatientResponse
+            {
+                Pesel = p.Pesel,
+                FirstName = p.FirstName,
+                LastName = p.LastName,
+                Age = p.Age,
+                Sex = p.Sex ? "Male" : "Female",
+                Admissions = p.Admissions.Select(a => new AdmissionDto
+                {
+                    Id = a.Id,
+                    AdmissionDate = a.AdmissionDate,
+                    DischargeDate = a.DischargeDate,
+                    Ward = new WardDto
+                    {
+                        Id = a.Ward.Id,
+                        Name = a.Ward.Name,
+                        Description = a.Ward.Description
+                    }
+                }).ToList(),
+                BedAssignments = p.BedAssignments.Select(ba => new BedAssignmentDto
+                {
+                    Id = ba.Id,
+                    From = ba.From,
+                    To = ba.To,
+                    Bed = new BedDto
+                    {
+                        Id = ba.Bed.Id,
+                        BedType = new BedTypeDto
+                        {
+                            Id = ba.Bed.BedTypeNavigation.Id,
+                            Name = ba.Bed.BedTypeNavigation.Name,
+                            Description = ba.Bed.BedTypeNavigation.Description
+                        },
+                        Room = new RoomDto
+                        {
+                            Id = ba.Bed.Room.Id,
+                            HasTv = ba.Bed.Room.HasTv,
+                            Ward = new WardDto
+                            {
+                                Id = ba.Bed.Room.Ward.Id,
+                                Name = ba.Bed.Room.Ward.Name,
+                                Description = ba.Bed.Room.Ward.Description
+                            }
+                        }
+                        }
+            }).ToList()
+                    }).ToListAsync(cancellationToken);
     }
 
     public async Task AssignBedAsync(string pesel, AssignBedRequest request, CancellationToken cancellationToken)
     {
-        var patientExists = await db.Patients.AnyAsync(p => p.Pesel == pesel, cancellationToken);
+        var patientExists = await db.Patients
+            .AnyAsync(p => p.Pesel.Trim() == pesel.Trim(), cancellationToken);
         if (!patientExists)
         {
             throw new NotFoundException($"Pacjent o numerze PESEL {pesel} nie istnieje.");
         }
         var availableBed = await db.Beds
-            .Where(b=>b.BedTypeId==request.BedTypeId && b.Room.WardId == request.WardId)
-            .Where(b=>!db.BedAssignments.Any(ba=>
+            .Where(b => b.BedTypeId == request.BedTypeId && b.Room.WardId == request.WardId)
+            .Where(b => !db.BedAssignments.Any(ba =>
                 ba.BedId == b.Id &&
-                ba.From <(request.To ?? DateTime.MaxValue)
-                && (ba.To==null || ba.To>request.From))).FirstOrDefaultAsync(cancellationToken);
+                (request.To == null || ba.From < request.To)
+                && (ba.To == null || ba.To > request.From)))
+            .FirstOrDefaultAsync(cancellationToken);
         if (availableBed == null)
         {
             throw new NotFoundException(
@@ -47,7 +93,7 @@ public class PatientsService(MasterContext db) : IPatientsService
         }
         var newAssignment = new BedAssignment
         {
-            PatientPesel = pesel,
+            PatientPesel = pesel.Trim(),
             BedId = availableBed.Id,
             From = request.From,
             To = request.To
