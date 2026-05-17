@@ -1,0 +1,6 @@
+@zd8_HostAddress = http://localhost:5062
+
+GET {{zd8_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
